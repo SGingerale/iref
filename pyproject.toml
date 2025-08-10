@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "iref"
+version = "0.0.1"
+description = "Illustration Refs – Discovery Queue CLI"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "typer[all]",
+  "rich",
+  "pillow",
+  "ImageHash",
+  "watchdog",
+  "orjson",
+  "python-dateutil",
+  "platformdirs",
+]
+
+[project.scripts]
+iref = "iref.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/iref"]
