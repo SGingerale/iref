@@ -12,10 +12,18 @@ from rich.table import Table
 from PIL import Image, UnidentifiedImageError
 import orjson
 
+from iref.config_store import ConfigStore
+
 app = typer.Typer(help="Illustration Refs – Discovery Queue CLI")
 console = Console()
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+# 既存の app を使い回し（app = typer.Typer() が既にある前提）
+config_app = typer.Typer(help="プロファイル設定を管理します")
+app.add_typer(config_app, name="config")
+
+_store = ConfigStore()
 
 def is_hidden_or_system_dir(p: Path) -> bool:
     name = p.name
@@ -74,7 +82,12 @@ def save_queue(state_dir: Path, items: List[Dict[str, Any]]) -> Path:
 
 @app.command("queue")
 def queue_cmd(
-    root: Path = typer.Argument(..., exists=True, file_okay=False, dir_okay=True, readable=True, help="画像ルート"),
+    root: Path = typer.Argument(
+        None,  # ← 省略可に
+        dir_okay=True, file_okay=False,
+        help="画像ルート（省略時は --profile の設定を使用）",
+    ),
+    profile: str = typer.Option("default", "--profile", "-p", help="設定プロフィール名（root未指定時に使用）"),
     dry_run: bool = typer.Option(False, "--dry-run", help="書き込みせずスキャンだけ実行"),
     limit: int = typer.Option(0, "--limit", min=0, help="最大件数。0なら制限なし"),
     ext: List[str] = typer.Option(
@@ -84,6 +97,22 @@ def queue_cmd(
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="詳細ログ"),
 ):
+    # root 未指定ならプロフィールから取得
+    if root is None:
+        cfg_root = _store.get_root(profile)
+        if not cfg_root:
+            typer.secho(
+                f"[queue] root 未指定で、プロフィール '{profile}' にも root がありません。\n"
+                f"まず: iref config set-root {profile} <フォルダ> を実行してください。",
+                fg=typer.colors.RED,
+            )
+            raise typer.Exit(code=2)
+        root = cfg_root
+    else:
+        # 明示された root の妥当性チェック
+        if not root.exists() or not root.is_dir():
+            typer.secho(f"[queue] Root が見つからないかディレクトリではありません: {root}", fg=typer.colors.RED)
+            raise typer.Exit(code=2)
     """
     画像を走査して `ROOT/.iref/queue.json` を作成/更新します。
     """
@@ -125,6 +154,39 @@ def config_cmd():
     いずれ設定系を実装する予定のプレースホルダ。
     """
     console.print("Config command is not implemented yet. Coming soon!")
+
+@config_app.command("set-root")
+def config_set_root(
+    profile: str = typer.Argument(..., help="プロフィール名（例: default）"),
+    root: Path = typer.Argument(..., exists=True, file_okay=False, help="ルートフォルダ"),
+):
+    """プロフィールのルートフォルダを登録"""
+    try:
+        real = _store.set_root(profile, root)
+        typer.secho(f'[config] "{profile}" = {real}', fg=typer.colors.GREEN)
+    except Exception as e:
+        typer.secho(f"[config] error: {e}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+@config_app.command("show")
+def config_show(
+    profile: str = typer.Argument("default", help="プロフィール名（省略時 default）"),
+):
+    root = _store.get_root(profile)
+    if not root:
+        typer.secho(f'[config] "{profile}" は未設定', fg=typer.colors.YELLOW)
+        raise typer.Exit(code=1)
+    typer.echo(str(root))
+
+@config_app.command("list")
+def config_list():
+    names = _store.list_profiles()
+    if not names:
+        typer.echo("（まだプロファイルがありません）")
+    else:
+        for n in names:
+            r = _store.get_root(n)
+            typer.echo(f"{n}: {r if r else '(unset)'}")
 
 def main():
     app()
