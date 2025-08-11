@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.scripts]
-iref = "iref.cli:app"
+iref = "iref.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/iref"]
