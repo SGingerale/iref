@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 import os
 import time
-from typing import Iterable, List, Dict, Any, Tuple
+from typing import Iterable, List, Dict, Any, Tuple, Optional
 
 import typer
 from rich.console import Console
@@ -13,17 +13,34 @@ from PIL import Image, UnidentifiedImageError
 import orjson
 
 from iref.config_store import ConfigStore
+# ↓ 追加：reviewで使う
+from iref.store.queue_store import (
+    load_queue, save_all, first_pending_index, find_index,
+)
+from iref.utils.open_image import open_image
+from iref.queue.review import review_loop
 
 app = typer.Typer(help="Illustration Refs – Discovery Queue CLI")
 console = Console()
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
-# 既存の app を使い回し（app = typer.Typer() が既にある前提）
+# --- sub apps ---
 config_app = typer.Typer(help="プロファイル設定を管理します")
 app.add_typer(config_app, name="config")
 
+# 追加：queueグループを用意（scan/reviewをぶら下げる）
+queue_app = typer.Typer(help="画像キューの作成とレビュー")
+app.add_typer(queue_app, name="queue")
+
 _store = ConfigStore()
+
+# --- 小ヘルパ：root解決 ---
+def resolve_root_from_profile(profile: str) -> Optional[Path]:
+    r = _store.get_root(profile)
+    if r and r.exists() and r.is_dir():
+        return r
+    return None
 
 def is_hidden_or_system_dir(p: Path) -> bool:
     name = p.name
@@ -80,10 +97,10 @@ def save_queue(state_dir: Path, items: List[Dict[str, Any]]) -> Path:
     out_path.write_bytes(orjson.dumps(payload, option=orjson.OPT_INDENT_2))
     return out_path
 
-@app.command("queue")
-def queue_cmd(
+@queue_app.command("scan")   # ← ここを queue_app に
+def queue_scan_cmd(
     root: Path = typer.Argument(
-        None,  # ← 省略可に
+        None,
         dir_okay=True, file_okay=False,
         help="画像ルート（省略時は --profile の設定を使用）",
     ),
@@ -97,25 +114,21 @@ def queue_cmd(
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="詳細ログ"),
 ):
-    # root 未指定ならプロフィールから取得
     if root is None:
-        cfg_root = _store.get_root(profile)
+        cfg_root = resolve_root_from_profile(profile)
         if not cfg_root:
             typer.secho(
-                f"[queue] root 未指定で、プロフィール '{profile}' にも root がありません。\n"
+                f"[queue scan] root 未指定で、プロフィール '{profile}' にも root がありません。\n"
                 f"まず: iref config set-root {profile} <フォルダ> を実行してください。",
                 fg=typer.colors.RED,
             )
             raise typer.Exit(code=2)
         root = cfg_root
     else:
-        # 明示された root の妥当性チェック
         if not root.exists() or not root.is_dir():
-            typer.secho(f"[queue] Root が見つからないかディレクトリではありません: {root}", fg=typer.colors.RED)
+            typer.secho(f"[queue scan] Root が見つからないかディレクトリではありません: {root}", fg=typer.colors.RED)
             raise typer.Exit(code=2)
-    """
-    画像を走査して `ROOT/.iref/queue.json` を作成/更新します。
-    """
+
     root = root.resolve()
     if verbose:
         console.print(f"[bold]Root:[/bold] {root}")
@@ -125,6 +138,7 @@ def queue_cmd(
     for p in iter_image_files(root, ext):
         info, err = get_image_info(p)
         if info:
+            # 既存スキーマのまま。statusはreview側で補完する
             files.append(info)
             if limit and len(files) >= limit:
                 break
@@ -133,7 +147,6 @@ def queue_cmd(
             if verbose:
                 console.print(f"[yellow]WARN[/]: {err}")
 
-    # 人間向けサマリ
     table = Table(title="Scan Summary")
     table.add_column("Found")
     table.add_column("Errors")
@@ -147,6 +160,65 @@ def queue_cmd(
     state_dir = ensure_state_dir(root)
     out_path = save_queue(state_dir, files)
     console.print(f"[green]Wrote:[/green] {out_path}  ({len(files)} items)")
+
+@queue_app.command("review")
+def queue_review_cmd(
+    root: Optional[Path] = typer.Argument(None, exists=False),
+    profile: str = typer.Option("default", "--profile", "-p"),
+    viewer: Optional[str] = typer.Option(None, "--viewer", help="画像ビューアのコマンド"),
+    start_from: Optional[str] = typer.Option(None, "--start-from", help="INDEX または RELPATH"),
+    no_open: bool = typer.Option(False, "--no-open", help="自動で画像を開かない"),
+):
+    # 1) root を解決
+    if root is None:
+        root = resolve_root_from_profile(profile)
+    if root is None:
+        typer.secho("root を解決できません。--profile も確認してね。", fg=typer.colors.RED)
+        raise typer.Exit(code=2)
+
+    # 2) queue.json をロード
+    q = load_queue(root)
+    items = q["items"]
+    if not items:
+        typer.echo("キューが空です。先に `iref queue scan` を実行してください。")
+        raise typer.Exit()
+
+    # 2.5) status/decided_at の初期化（scanが付けてない想定を補完）
+    touched = False
+    for it in items:
+        if "status" not in it:
+            it["status"] = "pending"
+            it["decided_at"] = None
+            touched = True
+    if touched:
+        save_all(root, q)
+
+    # 3) 開始インデックス
+    if start_from is None:
+        index = first_pending_index(items)
+    else:
+        try:
+            index = int(start_from) if start_from.isdigit() else find_index(items, start_from)
+        except Exception as e:
+            typer.echo(f"--start-from の解決に失敗: {e}")
+            raise typer.Exit(code=2)
+
+    # 4) 依存注入
+    def _open(cur):
+        if no_open:
+            return
+        rp = Path(cur["relpath"])
+        path = rp if rp.is_absolute() else (root / rp)
+        open_image(path, viewer)
+
+    def _save(i, new_item):
+        items[i] = dict(new_item)
+
+    def _flush():
+        save_all(root, q)
+
+    # 5) 実行
+    review_loop(items, _open, _save, _flush, start_index=index, auto_open=not no_open)
 
 @app.command("config")
 def config_cmd():

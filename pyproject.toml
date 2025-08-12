@@ -17,10 +17,11 @@ dependencies = [
   "orjson",
   "python-dateutil",
   "platformdirs",
+  "readchar>=4.0",          # ← 追加
 ]
 
 [project.scripts]
 iref = "iref.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/iref"]
+packages = ["src/iref"]   # ← ここをこの1行に。ほかは不要
